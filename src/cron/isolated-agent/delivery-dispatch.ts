@@ -376,12 +376,18 @@ export function getCompletedDirectCronDeliveriesCountForTests(): number {
 // ---------------------------------------------------------------------------
 // Slot-level delivery deduplication.
 //
-// The per-run idempotency cache above is keyed by `runSessionId`, so it only
-// prevents replay within a single run.  If the same cron job fires twice for
-// the **same scheduled time slot** (e.g. multi-process race, restart catch-up
-// overlap, or timer edge case), each run gets a fresh session ID and bypasses
-// the cache.  This slot-level guard closes that gap by tracking
-// `jobId + scheduledAtMs + deliveryTarget` regardless of run session.
+// The execution-level idempotency cache above is keyed by `executionId =
+// createCronExecutionId(jobId, runStartedAt)`, so it only prevents replay
+// within a single execution.  If the same cron job fires twice for the
+// **same scheduled time slot** with different `runStartedAt` values (e.g.
+// restart catch-up replaying a slot the original run already delivered, or
+// a same-process timer edge case), each run gets a fresh execution ID and
+// bypasses the cache.  This slot-level guard closes that gap by tracking
+// `jobId + scheduledAtMs + deliveryTarget` regardless of execution.
+//
+// Scope: this is a process-local Map.  Cross-process races require
+// persistent state (Redis / DB / file lock) and are out of scope here;
+// the TTL and LRU cap are sized accordingly.
 // ---------------------------------------------------------------------------
 
 const COMPLETED_SLOT_DELIVERIES = new Map<string, number>();
@@ -397,7 +403,10 @@ function buildSlotDeliveryKey(
 }
 
 function pruneSlotDeliveries(now: number) {
-  const ttlMs = process.env.OPENCLAW_TEST_FAST === "1" ? 60_000 : 24 * 60 * 60 * 1000;
+  // 1h TTL: this is process-local memory and gets cleared on restart, so a
+  // longer TTL adds memory pressure without buying durability.  ~1h covers
+  // typical restart catch-up windows and a few cron intervals.
+  const ttlMs = process.env.OPENCLAW_TEST_FAST === "1" ? 60_000 : 60 * 60 * 1000;
   for (const [key, ts] of COMPLETED_SLOT_DELIVERIES) {
     if (now - ts >= ttlMs) {
       COMPLETED_SLOT_DELIVERIES.delete(key);
@@ -647,8 +656,9 @@ export async function dispatchCronDelivery(
         return null;
       }
       // Slot-level dedup: prevent duplicate delivery when the same job fires
-      // twice for the same scheduled time slot from different run sessions
-      // (e.g. multi-process race or restart catch-up overlap).
+      // twice for the same scheduled slot with different `runStartedAt`
+      // values (e.g. restart catch-up replaying a slot).  Same-process scope
+      // only — see the COMPLETED_SLOT_DELIVERIES comment header for details.
       const scheduledAtMs = resolveCronDeliveryScheduledAtMs({
         job: params.job,
         runStartedAt: params.runStartedAt,
